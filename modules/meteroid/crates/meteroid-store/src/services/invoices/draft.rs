@@ -429,8 +429,17 @@ impl Services {
         let invoice_date = proration.change_date;
         let period_end = proration.period_end;
 
-        let invoice_lines: Vec<LineItem> = proration
-            .lines
+        // Net override credit/charge pairs (a price override is decomposed into
+        // an old-price credit + new-price charge) so tax applies to the delta
+        // rather than to the gross charge beside an untaxed credit.
+        let netted =
+            crate::services::subscriptions::proration::net_override_lines(&proration.lines);
+
+        let precision =
+            crate::constants::Currencies::resolve_currency_precision(&subscription.currency)
+                .unwrap_or(2);
+
+        let invoice_lines: Vec<LineItem> = netted
             .iter()
             .map(|line| {
                 let amount_subtotal = line.amount_cents;
@@ -438,6 +447,41 @@ impl Services {
                     amount_subtotal
                 } else {
                     0
+                };
+
+                // Prorated lines cover the remaining period (change date → period
+                // end); one-time charges are billed in full at the change date.
+                let end_date = if line.is_prorated {
+                    period_end
+                } else {
+                    invoice_date
+                };
+
+                // A genuinely-added component/add-on carries the subscription-row id it
+                // bills. Stamp it (plus a unit_price/quantity representation) onto the
+                // line so a later removal can match and credit this charge via the same
+                // line-level machinery used for recurring invoices. Charges only
+                // (amount_subtotal > 0); credits never reach the adjustment invoice.
+                let billed_sub = line.sub_component_id.is_some() || line.sub_add_on_id.is_some();
+                let (quantity, unit_price) = if amount_subtotal > 0 {
+                    match line.quantity.filter(|q| !q.is_zero()) {
+                        // Real billed quantity (e.g. a one-time charge of N units):
+                        // show quantity × unit price rather than 1 × total.
+                        Some(q) => {
+                            let unit = line.unit_price.unwrap_or_else(|| {
+                                Decimal::new(amount_subtotal, u32::from(precision)) / q
+                            });
+                            (Some(q), Some(unit))
+                        }
+                        // Fall back to 1 × total when tracking a specific billed row.
+                        None if billed_sub => (
+                            Some(Decimal::ONE),
+                            Some(Decimal::new(amount_subtotal, u32::from(precision))),
+                        ),
+                        None => (None, None),
+                    }
+                } else {
+                    (None, None)
                 };
 
                 LineItem {
@@ -449,15 +493,15 @@ impl Services {
                     tax_amount: 0,
                     amount_total: amount_subtotal,
                     tax_details: vec![],
-                    quantity: None,
-                    unit_price: None,
+                    quantity,
+                    unit_price,
                     start_date: invoice_date,
-                    end_date: period_end,
+                    end_date,
                     sub_lines: vec![],
-                    is_prorated: true,
+                    is_prorated: line.is_prorated,
                     price_component_id: line.price_component_id,
-                    sub_component_id: None,
-                    sub_add_on_id: None,
+                    sub_component_id: line.sub_component_id,
+                    sub_add_on_id: line.sub_add_on_id,
                     product_id: line.product_id,
                     metric_id: None,
                     description: None,
@@ -683,6 +727,10 @@ impl Services {
                     product_id: resolved.product_id,
                     price_id: resolved.price_id,
                     quantity: cs_ao.quantity,
+                    effective_from: now,
+                    effective_to: None,
+                    lineage_id: None,
+                    added_by_amendment: false,
                 });
         }
 
@@ -713,8 +761,14 @@ impl Services {
                     amount_cents: l.amount_subtotal,
                     full_period_amount_cents: l.amount_subtotal,
                     is_credit: false,
+                    is_prorated: l.is_prorated,
+                    quantity: l.quantity,
+                    unit_price: l.unit_price,
                     product_id: l.product_id,
                     price_component_id: l.price_component_id,
+                    net_key: None,
+                    sub_component_id: l.sub_component_id,
+                    sub_add_on_id: l.sub_add_on_id,
                 })
                 .collect(),
             net_amount_cents: invoice_content.subtotal,

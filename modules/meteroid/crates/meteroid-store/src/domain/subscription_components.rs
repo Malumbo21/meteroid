@@ -27,6 +27,18 @@ pub trait SubscriptionFeeInterface {
     fn effective_to(&self) -> Option<chrono::NaiveDate> {
         None
     }
+    /// Number of instances this record bills. Add-ons store a per-unit fee with
+    /// the instance count separately; fixed fees bill for all instances by
+    /// carrying this count on the line's quantity (so the line reads N × unit
+    /// price, not 1 × N·price). Defaults to 1 for plan components.
+    fn instance_quantity(&self) -> rust_decimal::Decimal {
+        rust_decimal::Decimal::ONE
+    }
+    /// True when added by a manual amendment. Drives one-time-fee billing on the
+    /// effective period (see `process_fee_records`). Defaults to false.
+    fn added_by_amendment(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -41,6 +53,21 @@ pub struct SubscriptionComponent {
     pub price_id: Option<PriceId>,
     pub effective_from: chrono::NaiveDate,
     pub effective_to: Option<chrono::NaiveDate>,
+    /// Lineage root this component descends from across overrides. `None` means the
+    /// row is its own root.
+    pub lineage_id: Option<SubscriptionPriceComponentId>,
+    /// True when this component was added by a manual amendment. A one-time fee on
+    /// such a component is billed on the invoice for the period it becomes effective.
+    pub added_by_amendment: bool,
+}
+
+impl SubscriptionComponent {
+    /// The lineage root id: the original component this one descends from across
+    /// overrides, or its own id when it is a root.
+    #[inline]
+    pub fn lineage(&self) -> SubscriptionPriceComponentId {
+        self.lineage_id.unwrap_or(self.id)
+    }
 }
 
 impl SubscriptionFeeInterface for SubscriptionComponent {
@@ -93,6 +120,11 @@ impl SubscriptionFeeInterface for SubscriptionComponent {
     fn effective_to(&self) -> Option<chrono::NaiveDate> {
         self.effective_to
     }
+
+    #[inline]
+    fn added_by_amendment(&self) -> bool {
+        self.added_by_amendment
+    }
 }
 
 impl TryInto<SubscriptionComponent> for SubscriptionComponentRow {
@@ -120,6 +152,8 @@ impl TryInto<SubscriptionComponent> for SubscriptionComponentRow {
             price_id: self.price_id,
             effective_from: self.effective_from,
             effective_to: self.effective_to,
+            lineage_id: self.lineage_id,
+            added_by_amendment: self.added_by_amendment,
         })
     }
 }
@@ -156,6 +190,12 @@ impl TryInto<SubscriptionComponentRowNew> for SubscriptionComponentNew {
             legacy_fee: Some(legacy_fee),
             price_id: self.internal.price_id,
             effective_from: self.internal.effective_from,
+            // Default to a root; the amendment override path sets the predecessor's
+            // lineage on the row after conversion.
+            lineage_id: None,
+            // Defaults to false; amendment insert paths flip it on the row after
+            // conversion so a one-time fee bills on its effective period.
+            added_by_amendment: false,
         })
     }
 }

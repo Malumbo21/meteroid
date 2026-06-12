@@ -1,12 +1,13 @@
 use crate::StoreResult;
 use crate::constants::{Currencies, Currency};
 use crate::domain::{
-    ComponentPeriods, CouponLineItem, Customer, Invoice, InvoicingEntity, LineItem,
-    SubscriptionComponent, SubscriptionDetails, SubscriptionFeeInterface, TaxBreakdownItem,
-    TaxResolverEnum,
+    ComponentPeriods, CouponLineItem, Customer, Invoice, InvoicingEntity, LineItem, Period,
+    SubscriptionAddOn, SubscriptionComponent, SubscriptionDetails, SubscriptionFee,
+    SubscriptionFeeInterface, TaxBreakdownItem, TaxResolverEnum,
 };
 use chrono::NaiveDate;
-use common_domain::ids::{PriceComponentId, SubscriptionPriceComponentId};
+use common_domain::ids::{PriceComponentId, SubscriptionAddOnId, SubscriptionPriceComponentId};
+use diesel_models::subscription_add_ons::SubscriptionAddOnRow;
 use diesel_models::subscription_components::SubscriptionComponentRow;
 use itertools::Itertools;
 use std::cmp::min;
@@ -28,7 +29,7 @@ use meteroid_tax::{ManualTaxEngine, MeteroidTaxEngine, TaxDetails, TaxEngine};
 
 impl Services {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ComputedInvoiceContent {
     pub invoice_lines: Vec<LineItem>,
     pub subtotal: i64, // before discounts, coupons, credits, taxes
@@ -132,6 +133,9 @@ impl Services {
             )
             .await?;
 
+        // Add-ons store their fee per-unit with an instance count in `quantity`.
+        // compute_component reads instance_count() from the trait and multiplies
+        // the fee's own quantity, so no pre-scaling is needed here.
         let add_ons_lines = self
             .process_fee_records(
                 conn,
@@ -229,6 +233,86 @@ impl Services {
             }
         };
 
+        // Load and process historical (closed) add-ons for arrears temporal split.
+        // When a mid-period amendment removed an arrears/usage add-on, the closed row
+        // still needs to be billed for its temporal segment [effective_from, effective_to].
+        let historical_addon_lines = {
+            let active_addon_ids: HashSet<SubscriptionAddOnId> =
+                subscription_details.add_ons.iter().map(|a| a.id).collect();
+
+            let historical_rows = SubscriptionAddOnRow::list_add_on_history_for_period(
+                conn,
+                &subscription_details.subscription.id,
+                billing_start_date,
+                invoice_date,
+            )
+            .await
+            .map_err(Into::<Report<StoreError>>::into)?;
+
+            let historical_addons: Vec<SubscriptionAddOn> = historical_rows
+                .into_iter()
+                .filter(|row| row.effective_to.is_some())
+                .filter(|row| !active_addon_ids.contains(&row.id))
+                .filter_map(|row| {
+                    let ao: Result<SubscriptionAddOn, _> = row.try_into();
+                    ao.ok()
+                })
+                .filter(|ao| ao.fee.is_pure_arrears())
+                .collect();
+
+            if !historical_addons.is_empty() {
+                // Historical add-ons may reference metrics not loaded in subscription_details
+                // (e.g. the metric is no longer used by any active component/add-on).
+                let known_metric_ids: HashSet<_> =
+                    subscription_details.metrics.iter().map(|m| m.id).collect();
+
+                let missing_metric_ids: Vec<_> = historical_addons
+                    .iter()
+                    .filter_map(|a| a.fee.metric_id())
+                    .filter(|id| !known_metric_ids.contains(id))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+
+                let details_for_historical = if !missing_metric_ids.is_empty() {
+                    let extra_metrics: Vec<BillableMetric> = BillableMetricRow::get_by_ids(
+                        conn,
+                        &missing_metric_ids,
+                        &subscription_details.subscription.tenant_id,
+                    )
+                    .await
+                    .map_err(Into::<Report<StoreError>>::into)?
+                    .into_iter()
+                    .map(std::convert::TryInto::try_into)
+                    .collect::<Result<Vec<_>, Report<_>>>()?;
+
+                    let mut extended = subscription_details.clone();
+                    extended.metrics.extend(extra_metrics);
+                    Some(extended)
+                } else {
+                    None
+                };
+
+                let effective_details = details_for_historical
+                    .as_ref()
+                    .unwrap_or(subscription_details);
+
+                self.process_fee_records(
+                    conn,
+                    effective_details,
+                    &historical_addons,
+                    invoice_date,
+                    billing_start_date,
+                    cycle_index,
+                    currency,
+                    &existing_lines,
+                )
+                .await?
+            } else {
+                Vec::new()
+            }
+        };
+
         // Merge non-usage-based lines from existing invoice (if refreshing)
         let mut invoice_lines = if let Some(invoice) = invoice {
             // TODO quick fix, do that part in process_component instead
@@ -236,6 +320,7 @@ impl Services {
                 .into_iter()
                 .chain(add_ons_lines)
                 .chain(historical_lines)
+                .chain(historical_addon_lines)
                 .filter(&is_usage_based_line)
                 .collect_vec();
 
@@ -255,6 +340,7 @@ impl Services {
                 .into_iter()
                 .chain(add_ons_lines)
                 .chain(historical_lines)
+                .chain(historical_addon_lines)
                 .collect_vec()
         };
 
@@ -641,7 +727,18 @@ impl Services {
         currency: &Currency,
         existing_lines: &HashMap<ExistingLineKey, &LineItem>,
     ) -> StoreResult<Vec<LineItem>> {
-        let component_groups = fee_records.iter().into_group_map_by(|c| c.period_ref());
+        // One-time fees are billed exactly once and follow a different rule than the
+        // cadence-based components below: `applies_this_period` only admits one-time
+        // fees on cycle 0, which would silently drop a one-time fee added by a later
+        // amendment. Handle them separately so they bill on the invoice generated on
+        // the date they become effective.
+        let (one_time_records, recurring_records): (Vec<&T>, Vec<&T>) = fee_records
+            .iter()
+            .partition(|c| matches!(c.fee_ref(), SubscriptionFee::OneTime { .. }));
+
+        let component_groups = recurring_records
+            .into_iter()
+            .into_group_map_by(|c| c.period_ref());
 
         // TODO case when invoiced early via threshold (that's for usage-based only)
         // can be quite easy => we need some last_invoice_threshold date in the subscription, to reduce the usage periods if that date is within the period
@@ -698,6 +795,47 @@ impl Services {
             }
         }
 
+        // One-time fees: billed in full, never prorated, exactly once. Billing point:
+        //  - plan-level one-time fees bill on the subscription's first invoice
+        //    (`cycle_index == 0`); they are not re-billed on renewals or carried over
+        //    by a plan change (which is why `applies_this_period` excludes them);
+        //  - a one-time fee added by a manual amendment bills on the invoice for the
+        //    period it becomes effective (`effective_from == invoice_date`), which for
+        //    an immediate amendment is its adjustment invoice (handled elsewhere) and
+        //    for an end-of-period amendment is the upcoming renewal.
+        for component in one_time_records {
+            let bill_now = cycle_index == 0
+                || (component.added_by_amendment()
+                    && component.effective_from() == Some(invoice_date));
+            if !bill_now {
+                continue;
+            }
+
+            let periods = ComponentPeriods {
+                proration_factor: None,
+                arrear_proration_factor: None,
+                advance: Some(Period {
+                    start: invoice_date,
+                    end: invoice_date,
+                }),
+                arrear: None,
+            };
+
+            let lines = self
+                .compute_component(
+                    conn,
+                    subscription_details,
+                    component,
+                    periods,
+                    &invoice_date,
+                    currency.precision,
+                    existing_lines,
+                )
+                .await?;
+
+            invoice_lines.extend(lines);
+        }
+
         Ok(invoice_lines)
     }
 }
@@ -706,12 +844,21 @@ impl Services {
 /// - If effective_from > arrear.start: restrict arrear start to effective_from
 /// - If effective_to < arrear.end: restrict arrear end to effective_to
 /// - Returns the period unchanged if there are no temporal bounds or no arrear period.
+///
+/// When the arrear window is shrunk by a temporal bound (e.g. an arrears component
+/// added or removed mid-period via an amendment), a fixed-rate arrears fee must be
+/// prorated to the fraction of the period it was actually active — otherwise it
+/// would bill a full period's rate for a partial window. A proration factor is set
+/// for that case. Usage-based arrears ignore the factor (their amount derives from
+/// usage queried over the restricted window), so this is a no-op for them.
 fn restrict_arrear_period_by_temporal_bounds(
     mut periods: ComponentPeriods,
     effective_from: Option<NaiveDate>,
     effective_to: Option<NaiveDate>,
 ) -> ComponentPeriods {
     if let Some(ref mut arrear) = periods.arrear {
+        let full_days = (arrear.end - arrear.start).num_days();
+
         if let Some(from) = effective_from
             && from > arrear.start
         {
@@ -725,6 +872,16 @@ fn restrict_arrear_period_by_temporal_bounds(
         // If the restriction made the period invalid, remove it
         if arrear.start >= arrear.end {
             periods.arrear = None;
+            return periods;
+        }
+
+        // Prorate fixed-rate arrears down to the active fraction of the period. This
+        // is set on the arrear-only factor so it never affects the advance line of a
+        // component billed on the same period (e.g. an advance Rate add-on added
+        // mid-cycle must still bill its full next period at renewal).
+        let restricted_days = (arrear.end - arrear.start).num_days();
+        if full_days > 0 && restricted_days < full_days {
+            periods.arrear_proration_factor = Some(restricted_days as f64 / full_days as f64);
         }
     }
     periods
@@ -764,5 +921,88 @@ fn apply_temporal_date_range_to_names(lines: &mut [LineItem]) {
         {
             line.name = format!("{} ({} - {})", line.name, line.start_date, line.end_date);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn arrear_periods(start: NaiveDate, end: NaiveDate) -> ComponentPeriods {
+        ComponentPeriods {
+            arrear: Some(Period { start, end }),
+            advance: None,
+            proration_factor: None,
+            arrear_proration_factor: None,
+        }
+    }
+
+    #[test]
+    fn arrear_added_mid_period_is_prorated() {
+        // An arrears component effective from Jan 16 in a [Jan 1, Feb 1] period
+        // should be prorated to the remaining 16 of 31 days.
+        let periods = restrict_arrear_period_by_temporal_bounds(
+            arrear_periods(date(2025, 1, 1), date(2025, 2, 1)),
+            Some(date(2025, 1, 16)),
+            None,
+        );
+
+        let arrear = periods.arrear.expect("arrear retained");
+        assert_eq!(arrear.start, date(2025, 1, 16));
+        assert_eq!(arrear.end, date(2025, 2, 1));
+        let factor = periods.arrear_proration_factor.expect("arrear prorated");
+        assert!((factor - 16.0 / 31.0).abs() < 1e-9, "got {factor}");
+        // The advance factor must stay untouched (advance lines bill in full).
+        assert_eq!(periods.proration_factor, None);
+    }
+
+    #[test]
+    fn arrear_removed_mid_period_is_prorated() {
+        // Closed at Jan 16: only [Jan 1, Jan 16] (15/31) should be billed.
+        let periods = restrict_arrear_period_by_temporal_bounds(
+            arrear_periods(date(2025, 1, 1), date(2025, 2, 1)),
+            None,
+            Some(date(2025, 1, 16)),
+        );
+
+        let arrear = periods.arrear.expect("arrear retained");
+        assert_eq!(arrear.start, date(2025, 1, 1));
+        assert_eq!(arrear.end, date(2025, 1, 16));
+        let factor = periods.arrear_proration_factor.expect("arrear prorated");
+        assert!((factor - 15.0 / 31.0).abs() < 1e-9, "got {factor}");
+        assert_eq!(periods.proration_factor, None);
+    }
+
+    #[test]
+    fn arrear_full_period_is_not_prorated() {
+        // A component active for the whole period (effective_from == arrear.start)
+        // keeps the full rate — no proration factor.
+        let periods = restrict_arrear_period_by_temporal_bounds(
+            arrear_periods(date(2025, 1, 1), date(2025, 2, 1)),
+            Some(date(2025, 1, 1)),
+            None,
+        );
+
+        assert_eq!(periods.arrear_proration_factor, None);
+        assert_eq!(periods.proration_factor, None);
+        let arrear = periods.arrear.expect("arrear retained");
+        assert_eq!(arrear.start, date(2025, 1, 1));
+        assert_eq!(arrear.end, date(2025, 2, 1));
+    }
+
+    #[test]
+    fn arrear_restricted_to_empty_is_dropped() {
+        // effective_from at/after the period end removes the arrear entirely.
+        let periods = restrict_arrear_period_by_temporal_bounds(
+            arrear_periods(date(2025, 1, 1), date(2025, 2, 1)),
+            Some(date(2025, 2, 1)),
+            None,
+        );
+
+        assert!(periods.arrear.is_none());
     }
 }

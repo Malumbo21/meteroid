@@ -2,7 +2,7 @@ use crate::domain::enums::{BillingPeriodEnum, SubscriptionFeeBillingPeriod};
 use crate::domain::price_components::PriceEntry;
 use crate::domain::{SubscriptionFee, SubscriptionFeeInterface};
 use crate::errors::{StoreError, StoreErrorReport};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use common_domain::ids::{
     AddOnId, BaseId, PriceComponentId, PriceId, ProductId, SubscriptionAddOnId, SubscriptionId,
     SubscriptionPriceComponentId,
@@ -22,6 +22,23 @@ pub struct SubscriptionAddOn {
     pub product_id: Option<ProductId>,
     pub price_id: Option<PriceId>,
     pub quantity: i32,
+    pub effective_from: NaiveDate,
+    pub effective_to: Option<NaiveDate>,
+    /// Lineage root this add-on descends from across overrides. `None` means the
+    /// row is its own root.
+    pub lineage_id: Option<SubscriptionAddOnId>,
+    /// True when this add-on was added by a manual amendment. A one-time fee on such
+    /// an add-on is billed on the invoice for the period it becomes effective.
+    pub added_by_amendment: bool,
+}
+
+impl SubscriptionAddOn {
+    /// The lineage root id: the original add-on this one descends from across
+    /// overrides, or its own id when it is a root.
+    #[inline]
+    pub fn lineage(&self) -> SubscriptionAddOnId {
+        self.lineage_id.unwrap_or(self.id)
+    }
 }
 
 impl SubscriptionFeeInterface for SubscriptionAddOn {
@@ -64,6 +81,26 @@ impl SubscriptionFeeInterface for SubscriptionAddOn {
     fn sub_add_on_id(&self) -> Option<SubscriptionAddOnId> {
         Some(self.id)
     }
+
+    #[inline]
+    fn instance_quantity(&self) -> rust_decimal::Decimal {
+        rust_decimal::Decimal::from(self.quantity.max(0))
+    }
+
+    #[inline]
+    fn effective_from(&self) -> Option<NaiveDate> {
+        Some(self.effective_from)
+    }
+
+    #[inline]
+    fn effective_to(&self) -> Option<NaiveDate> {
+        self.effective_to
+    }
+
+    #[inline]
+    fn added_by_amendment(&self) -> bool {
+        self.added_by_amendment
+    }
 }
 
 impl TryInto<SubscriptionAddOn> for SubscriptionAddOnRow {
@@ -91,6 +128,10 @@ impl TryInto<SubscriptionAddOn> for SubscriptionAddOnRow {
             product_id: self.product_id,
             price_id: self.price_id,
             quantity: self.quantity,
+            effective_from: self.effective_from,
+            effective_to: self.effective_to,
+            lineage_id: self.lineage_id,
+            added_by_amendment: self.added_by_amendment,
         })
     }
 }
@@ -104,6 +145,7 @@ pub struct SubscriptionAddOnNewInternal {
     pub product_id: Option<ProductId>,
     pub price_id: Option<PriceId>,
     pub quantity: i32,
+    pub effective_from: NaiveDate,
 }
 
 #[derive(Clone, Debug)]
@@ -116,11 +158,11 @@ impl TryInto<SubscriptionAddOnRowNew> for SubscriptionAddOnNew {
     type Error = StoreErrorReport;
 
     fn try_into(self) -> Result<SubscriptionAddOnRowNew, Self::Error> {
-        let legacy_fee = if self.internal.price_id.is_some() {
-            None
-        } else {
-            Some(self.internal.fee.try_into()?)
-        };
+        // Always snapshot the resolved fee into legacy_fee (even for v2 price-backed
+        // add-ons), mirroring subscription_component. The active loader still resolves
+        // v2 add-ons from their price_id; the snapshot is what lets historical/closed
+        // add-on rows be reconstructed for arrears billing after a mid-cycle removal.
+        let legacy_fee = Some(self.internal.fee.try_into()?);
 
         Ok(SubscriptionAddOnRowNew {
             id: SubscriptionAddOnId::new(),
@@ -132,6 +174,13 @@ impl TryInto<SubscriptionAddOnRowNew> for SubscriptionAddOnNew {
             product_id: self.internal.product_id,
             price_id: self.internal.price_id,
             quantity: self.internal.quantity,
+            effective_from: self.internal.effective_from,
+            // Default to a root; the amendment override path sets the predecessor's
+            // lineage on the row after conversion.
+            lineage_id: None,
+            // Defaults to false; amendment insert paths flip it on the row after
+            // conversion so a one-time fee bills on its effective period.
+            added_by_amendment: false,
         })
     }
 }
