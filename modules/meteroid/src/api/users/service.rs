@@ -21,7 +21,6 @@ use validator::{ValidateEmail, ValidateLength};
 
 use crate::api::shared::conversions::ProtoConv;
 use crate::api::users::error::UserApiError;
-use crate::parse_uuid;
 use common_domain::ids::OrganizationInviteId;
 
 use super::{UsersServiceComponents, mapping};
@@ -80,9 +79,10 @@ impl UsersService for UsersServiceComponents {
 
         let req = request.into_inner();
 
+        let user_id = common_domain::ids::UserId::from_proto(&req.id)?;
         let user = self
             .store
-            .find_user_by_id_and_tenant(parse_uuid!(&req.id)?, tenant)
+            .find_user_by_id_and_tenant(common_domain::ids::BaseId::as_uuid(&user_id), tenant)
             .await
             .map(mapping::user::domain_with_role_to_proto)
             .map_err(Into::<UserApiError>::into)?;
@@ -392,7 +392,7 @@ impl UsersService for UsersServiceComponents {
         let org_id = request.organization()?;
         let req = request.into_inner();
 
-        let target_user_id = parse_uuid!(&req.user_id)?;
+        let target_user_id = *common_domain::ids::UserId::from_proto(&req.user_id)?;
 
         self.store
             .remove_member(actor, target_user_id, org_id)
