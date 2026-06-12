@@ -169,6 +169,7 @@ fn create_test_invoice() -> Invoice {
                 tax_rate: Decimal::from_str("20.0").unwrap(),
                 start_date,
                 end_date,
+                is_prorated: false,
                 sub_lines: vec![
                     InvoiceSubLine {
                         name: "Frontend Development".to_string(),
@@ -183,6 +184,7 @@ fn create_test_invoice() -> Invoice {
                         unit_price: Money::from_major(50, eur),
                     },
                 ],
+                group_label: None,
             },
             InvoiceLine {
                 name: "Software License".to_string(),
@@ -193,7 +195,9 @@ fn create_test_invoice() -> Invoice {
                 tax_rate: Decimal::from_str("20.0").unwrap(),
                 start_date,
                 end_date,
+                is_prorated: false,
                 sub_lines: vec![],
+                group_label: None,
             },
         ],
         coupons: vec![

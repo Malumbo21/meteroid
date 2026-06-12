@@ -3,7 +3,7 @@ import {
   createProtobufSafeUpdater,
   useMutation,
 } from '@connectrpc/connect-query'
-import { Button, Card, Form, InputFormField, TextareaFormField } from '@md/ui'
+import { Badge, Button, Card, Form, InputFormField, Switch, TextareaFormField } from '@md/ui'
 import { useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { toast } from 'sonner'
@@ -134,6 +134,24 @@ export const InvoiceTab = () => {
                 placeholder="30"
                 containerClassName="col-span-3"
               />
+
+              {/* enterprise-only */}
+              <div className="col-span-6 flex flex-row items-start space-x-3 space-y-0 py-4">
+                <Switch checked={false} disabled />
+                <div className="space-y-1 leading-none">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium">Consolidate recurring invoices</span>
+                    <Badge variant="ghost" size="sm">
+                      Enterprise
+                    </Badge>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    Merge a customer&apos;s subscriptions that renew on the same day (same currency,
+                    payment method and net terms) into a single invoice. Available in Meteroid Cloud
+                    and Enterprise edition.
+                  </p>
+                </div>
+              </div>
             </div>
             <div className="pt-4">
               <h3 className="font-medium text-lg">Invoice footer</h3>

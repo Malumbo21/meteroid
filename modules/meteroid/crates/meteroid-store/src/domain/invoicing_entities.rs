@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, o2o)]
 #[map_owned(InvoicingEntityRow)]
+// enterprise-only
+#[ghosts(consolidate_recurring_invoices: {false})]
 pub struct InvoicingEntity {
     pub id: InvoicingEntityId,
     pub is_default: bool,
@@ -89,7 +91,8 @@ pub struct InvoicingEntityNew {
 
 #[derive(Clone, Debug, o2o, Default)]
 #[owned_into(InvoicingEntityRowPatch)]
-#[ghosts(accounting_currency: {None})]
+// consolidate_recurring_invoices is enterprise-only
+#[ghosts(accounting_currency: {None}, consolidate_recurring_invoices: {None})]
 pub struct InvoicingEntityPatch {
     pub id: InvoicingEntityId,
     pub legal_name: Option<String>,

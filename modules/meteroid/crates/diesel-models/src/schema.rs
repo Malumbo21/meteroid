@@ -732,6 +732,7 @@ diesel::table! {
         marked_as_uncollectible_at -> Nullable<Timestamp>,
         invoicing_entity_id -> Uuid,
         parent_invoice_id -> Nullable<Uuid>,
+        consolidated_into_invoice_id -> Nullable<Uuid>,
     }
 }
 
@@ -767,6 +768,7 @@ diesel::table! {
         bank_account_id -> Nullable<Uuid>,
         direct_debit_provider_id -> Nullable<Uuid>,
         tax_resolver -> TaxResolverEnum,
+        consolidate_recurring_invoices -> Bool,
     }
 }
 
@@ -1084,6 +1086,7 @@ diesel::table! {
         legacy_fee -> Nullable<Jsonb>,
         is_override -> Bool,
         price_id -> Nullable<Uuid>,
+        example_usage_quantity -> Nullable<Numeric>,
     }
 }
 
