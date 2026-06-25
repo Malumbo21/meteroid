@@ -7068,9 +7068,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -8165,7 +8165,6 @@ dependencies = [
 [[package]]
 name = "secrecy"
 version = "0.10.3"
-source = "git+https://github.com/iqlusioninc/crates?rev=0e9c9fd6d313381273fa882df07300f2a01c344b#0e9c9fd6d313381273fa882df07300f2a01c344b"
 dependencies = [
  "serde",
  "zeroize",
